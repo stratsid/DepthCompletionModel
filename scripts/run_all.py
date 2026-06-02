@@ -198,6 +198,16 @@ def main():
     print("STEP 5: Writing output.json")
     print("=" * 60)
 
+    def extract_metrics(summary: dict) -> dict:
+        """Pull the 5 key metrics into a flat dict for easy comparison."""
+        return {
+            "rmse": summary.get("rmse"),
+            "mae": summary.get("mae"),
+            "absrel": summary.get("absrel"),
+            "runtime_mean_ms": summary.get("runtime_mean_ms"),
+            "total_params": summary.get("total_params"),  # None for Marigold
+        }
+
     run_details = {}
     for cfg_name in args.configs:
         train_log_path = REPO_ROOT / "checkpoints" / cfg_name / "train_log.csv"
@@ -206,18 +216,23 @@ def main():
             df = pd.read_csv(train_log_path)
             training_curves = {col: df[col].tolist() for col in df.columns}
 
+        eval_summary = completed_runs.get(cfg_name, {})
         run_details[cfg_name] = {
             "config": cfg_name,
             "checkpoint": str(REPO_ROOT / "checkpoints" / cfg_name / "best.pth"),
+            "metrics": extract_metrics(eval_summary),
             "training_curves": training_curves,
-            "eval": completed_runs.get(cfg_name, {}),
+            "eval": eval_summary,
         }
 
     output = {
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "smoke_test": args.smoke_test,
         "total_wall_time_s": time.perf_counter() - start_time,
-        "marigold_dc": marigold_summary,
+        "marigold_dc": {
+            "metrics": extract_metrics(marigold_summary) if marigold_summary else None,
+            "eval": marigold_summary,
+        },
         "cnn_runs": run_details,
     }
 

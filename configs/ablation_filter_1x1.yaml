@@ -1,0 +1,36 @@
+dataset:
+  root: data/arkitscenes
+  target_hw: [768, 1024]
+  train_crop_hw: [512, 640]
+  confidence_threshold: 2
+  min_depth: 0.1
+  max_depth: 10.0
+  train_split_path: splits/train.txt
+  val_split_path: splits/val.txt
+  test_split_path: splits/test.txt
+
+loader:
+  batch_size: 4
+  num_workers: 4
+
+optimizer:
+  name: adamw
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+
+training:
+  epochs: 20
+  freeze_rgb_epochs: 1
+  grad_clip_norm: 1.0
+  lambda_grad: 0.5
+
+model:
+  pretrained_rgb: true
+  residual_scale: 0.2
+  depth_encoder_levels: 4
+  depth_filter_size: 1
+  depth_channels: [32, 64, 128, 256]
+  fusion_decoder_channels: [256, 128, 64, 32]
+
+evaluation:
+  warmup_samples: 1

@@ -122,7 +122,7 @@ def run_eval_cnn(
 
     for i, idx in enumerate(indices):
         batch = dataset[idx]
-        rgb = batch["rgb_norm"].unsqueeze(0).to(device)
+        rgb = batch["rgb"].unsqueeze(0).to(device)
         bicubic_norm = batch["bicubic_norm"].unsqueeze(0).to(device)
         conf_hi = batch["conf_hi"].unsqueeze(0).to(device)
         gt_np = batch["gt"][0].numpy()

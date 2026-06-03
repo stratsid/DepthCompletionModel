@@ -111,7 +111,7 @@ def train_one_epoch(
         if max_steps is not None and n_steps >= max_steps:
             break
 
-        rgb = batch["rgb_norm"].to(device)
+        rgb = batch["rgb"].to(device)
         bicubic_norm = batch["bicubic_norm"].to(device)
         conf_hi = batch["conf_hi"].to(device)
         gt = batch["gt"].to(device)
@@ -151,7 +151,7 @@ def validate(
         if max_steps is not None and batch_idx >= max_steps:
             break
 
-        rgb = batch["rgb_norm"].to(device)
+        rgb = batch["rgb"].to(device)
         bicubic_norm = batch["bicubic_norm"].to(device)
         conf_hi = batch["conf_hi"].to(device)
         gt = batch["gt"]
@@ -201,7 +201,7 @@ def main():
     # ---- data ----
     cfg_ds = cfg["dataset"]
     cfg_loader = cfg["loader"]
-    train_loader, val_loader = make_loaders(
+    train_loader, val_loader, _, _ = make_loaders(
         root=Path(cfg_ds["root"]),
         train_split_path=Path(cfg_ds["train_split_path"]),
         val_split_path=Path(cfg_ds["val_split_path"]),

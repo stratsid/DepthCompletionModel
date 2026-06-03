@@ -19,7 +19,7 @@ optimizer:
   weight_decay: 0.0001
 
 training:
-  epochs: 20
+  epochs: 10
   freeze_rgb_epochs: 1
 
 model:
@@ -31,7 +31,7 @@ model:
   fusion_decoder_channels: [256, 128, 64, 32]
 
 training:
-  epochs: 20
+  epochs: 10
   freeze_rgb_epochs: 1
   grad_clip_norm: 1.0
   lambda_grad: 0.5

@@ -2,7 +2,7 @@
 
 Usage:
     python -m scripts.train --config configs/baseline.yaml
-    python -m scripts.train --config configs/ablation_filter_1x1.yaml --device cuda:0
+    python -m scripts.train --config configs/baseline.yaml --compile   # torch.compile
     python -m scripts.train --config configs/baseline.yaml --max-steps 10  # smoke test
 """
 from __future__ import annotations
@@ -17,7 +17,6 @@ from typing import Dict, List
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -40,16 +39,12 @@ def _masked_l1(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> 
 
 def _masked_grad_l1(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     dy_pred = pred[:, :, 1:, :] - pred[:, :, :-1, :]
-    dy_tgt = target[:, :, 1:, :] - target[:, :, :-1, :]
+    dy_tgt  = target[:, :, 1:, :] - target[:, :, :-1, :]
     dx_pred = pred[:, :, :, 1:] - pred[:, :, :, :-1]
-    dx_tgt = target[:, :, :, 1:] - target[:, :, :, :-1]
-
+    dx_tgt  = target[:, :, :, 1:] - target[:, :, :, :-1]
     mask_y = mask[:, :, 1:, :] * mask[:, :, :-1, :]
     mask_x = mask[:, :, :, 1:] * mask[:, :, :, :-1]
-
-    loss_y = _masked_l1(dy_pred, dy_tgt, mask_y)
-    loss_x = _masked_l1(dx_pred, dx_tgt, mask_x)
-    return (loss_y + loss_x) * 0.5
+    return (_masked_l1(dy_pred, dy_tgt, mask_y) + _masked_l1(dx_pred, dx_tgt, mask_x)) * 0.5
 
 
 def depth_loss(
@@ -60,13 +55,11 @@ def depth_loss(
 ) -> torch.Tensor:
     gt_norm = gt / DEPTH_MAX
     mask = valid.float()
-    l1 = _masked_l1(pred_norm, gt_norm, mask)
-    grad = _masked_grad_l1(pred_norm, gt_norm, mask)
-    return l1 + lambda_grad * grad
+    return _masked_l1(pred_norm, gt_norm, mask) + lambda_grad * _masked_grad_l1(pred_norm, gt_norm, mask)
 
 
 # ---------------------------------------------------------------------------
-# Config loading
+# Config / model helpers
 # ---------------------------------------------------------------------------
 
 def load_config(path: Path) -> dict:
@@ -83,7 +76,18 @@ def build_model(cfg_model: dict, device: torch.device) -> RGBGuidedDepthUpsample
         depth_channels=tuple(cfg_model.get("depth_channels", [32, 64, 128, 256])),
         fusion_decoder_channels=tuple(cfg_model.get("fusion_decoder_channels", [256, 128, 64, 32])),
     )
-    return model.to(device)
+    model = model.to(device)
+    # channels_last gives 10-20% speedup on A100 for CNN workloads
+    if device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
+    return model
+
+
+def _to_device(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+    t = tensor.to(device, non_blocking=True)
+    if device.type == "cuda" and t.ndim == 4:
+        t = t.to(memory_format=torch.channels_last)
+    return t
 
 
 # ---------------------------------------------------------------------------
@@ -94,36 +98,46 @@ def train_one_epoch(
     model: RGBGuidedDepthUpsampler,
     loader,
     optimizer: torch.optim.Optimizer,
+    scaler: torch.cuda.amp.GradScaler,
     scheduler,
     device: torch.device,
     lambda_grad: float,
     grad_clip_norm: float,
+    use_amp: bool,
+    rgb_frozen: bool = True,
     max_steps: int | None = None,
     log_every: int = 50,
 ) -> float:
     model.train()
-    model.rgb_enc.eval()  # keep BN frozen if RGB encoder is frozen
+    # keep frozen RGB encoder in eval mode so its BN stats don't update
+    if rgb_frozen:
+        model.rgb_enc.eval()
 
     total_loss = 0.0
     n_steps = 0
+    amp_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
     for batch_idx, batch in enumerate(loader):
         if max_steps is not None and n_steps >= max_steps:
             break
 
-        rgb = batch["rgb"].to(device)
-        bicubic_norm = batch["bicubic_norm"].to(device)
-        conf_hi = batch["conf_hi"].to(device)
-        gt = batch["gt"].to(device)
-        valid = batch["valid"].to(device)
+        rgb        = _to_device(batch["rgb"],         device)
+        bicubic    = _to_device(batch["bicubic_norm"], device)
+        conf       = _to_device(batch["conf_hi"],      device)
+        gt         = _to_device(batch["gt"],           device)
+        valid      = _to_device(batch["valid"],        device)
 
-        pred_norm = model(rgb, bicubic_norm, conf_hi)
-        loss = depth_loss(pred_norm, gt, valid, lambda_grad=lambda_grad)
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+            forward_fn = model.forward_frozen if rgb_frozen else model.forward
+            pred_norm = forward_fn(rgb, bicubic, conf)
+            loss = depth_loss(pred_norm, gt, valid, lambda_grad=lambda_grad)
 
-        optimizer.zero_grad()
-        loss.backward()
+        optimizer.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         scheduler.step()
 
         total_loss += loss.item()
@@ -142,27 +156,34 @@ def validate(
     device: torch.device,
     min_depth: float,
     max_depth: float,
+    use_amp: bool,
     max_steps: int | None = None,
 ) -> Dict[str, float]:
     model.eval()
     rows: List[dict] = []
+    amp_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
     for batch_idx, batch in enumerate(loader):
         if max_steps is not None and batch_idx >= max_steps:
             break
 
-        rgb = batch["rgb"].to(device)
-        bicubic_norm = batch["bicubic_norm"].to(device)
-        conf_hi = batch["conf_hi"].to(device)
-        gt = batch["gt"]
+        rgb     = _to_device(batch["rgb"],         device)
+        bicubic = _to_device(batch["bicubic_norm"], device)
+        conf    = _to_device(batch["conf_hi"],      device)
+        gt      = batch["gt"]  # keep on CPU for numpy metrics
 
-        pred_norm = model(rgb, bicubic_norm, conf_hi)
-        pred_m = (pred_norm * DEPTH_MAX).clamp(min_depth, max_depth)
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+            pred_norm = model(rgb, bicubic, conf)
+
+        pred_m = (pred_norm.float() * DEPTH_MAX).clamp(min_depth, max_depth).cpu()
 
         for i in range(pred_m.shape[0]):
-            pred_np = pred_m[i, 0].cpu().numpy()
-            gt_np = gt[i, 0].numpy()
-            m = compute_metrics(pred_np, gt_np, min_depth=min_depth, max_depth=max_depth)
+            m = compute_metrics(
+                pred_m[i, 0].numpy(),
+                gt[i, 0].numpy(),
+                min_depth=min_depth,
+                max_depth=max_depth,
+            )
             rows.append(m)
 
     if not rows:
@@ -176,15 +197,12 @@ def validate(
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--config", type=Path, required=True)
-    p.add_argument("--device", type=str, default=None)
-    p.add_argument(
-        "--max-steps",
-        type=int,
-        default=None,
-        help="Limit steps per epoch (train and val). For smoke tests.",
-    )
-    p.add_argument("--run-name", type=str, default=None, help="Override auto-generated run name.")
+    p.add_argument("--config",    type=Path, required=True)
+    p.add_argument("--device",    type=str,  default=None)
+    p.add_argument("--run-name",  type=str,  default=None)
+    p.add_argument("--compile",   action="store_true", help="torch.compile the model (~1.3x speedup, adds startup time)")
+    p.add_argument("--no-amp",    action="store_true", help="Disable BF16 mixed precision")
+    p.add_argument("--max-steps", type=int,  default=None, help="Steps per epoch limit (smoke test)")
     return p.parse_args()
 
 
@@ -192,15 +210,16 @@ def main():
     args = parse_args()
     cfg = load_config(args.config)
 
-    if args.device is not None:
-        device = torch.device(args.device)
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = (device.type == "cuda") and not args.no_amp
+    print(f"Device: {device}  |  AMP: {use_amp}")
+
+    # cuDNN autotuner — picks fastest conv kernels for our fixed input sizes
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
 
     # ---- data ----
-    cfg_ds = cfg["dataset"]
-    cfg_loader = cfg["loader"]
+    cfg_ds, cfg_loader = cfg["dataset"], cfg["loader"]
     train_loader, val_loader, _, _ = make_loaders(
         root=Path(cfg_ds["root"]),
         train_split_path=Path(cfg_ds["train_split_path"]),
@@ -217,7 +236,10 @@ def main():
 
     # ---- model ----
     model = build_model(cfg["model"], device)
-    model.freeze_rgb()  # always start frozen; optionally unfreeze later
+    model.freeze_rgb()
+    if args.compile:
+        print("Compiling model with torch.compile...")
+        model = torch.compile(model, mode="reduce-overhead")
     total_p, trainable_p = count_parameters(model)
     print(f"Parameters: total={total_p:,}, trainable={trainable_p:,}")
 
@@ -230,14 +252,15 @@ def main():
     )
     cfg_train = cfg["training"]
     epochs = cfg_train["epochs"]
-    total_steps = epochs * len(train_loader)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs * len(train_loader)
+    )
 
-    lambda_grad = cfg_train.get("lambda_grad", 0.5)
-    grad_clip_norm = cfg_train.get("grad_clip_norm", 1.0)
+    lambda_grad      = cfg_train.get("lambda_grad", 0.5)
+    grad_clip_norm   = cfg_train.get("grad_clip_norm", 1.0)
     freeze_rgb_epochs = cfg_train.get("freeze_rgb_epochs", 1)
-    min_depth = cfg_ds["min_depth"]
-    max_depth = cfg_ds["max_depth"]
+    min_depth, max_depth = cfg_ds["min_depth"], cfg_ds["max_depth"]
 
     # ---- output dirs ----
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -252,16 +275,13 @@ def main():
     csv_writer.writeheader()
 
     best_absrel = float("inf")
-    print(f"\nStarting training — run '{run_name}'")
-    print(f"Checkpoints: {ckpt_dir}\n")
+    print(f"\nStarting training — run '{run_name}'\nCheckpoints: {ckpt_dir}\n")
 
     for epoch in range(1, epochs + 1):
-        # freeze/unfreeze RGB encoder per schedule
         if epoch <= freeze_rgb_epochs:
             model.freeze_rgb()
         else:
             model.unfreeze_rgb()
-            # rebuild optimizer to include RGB params on first unfreeze
             if epoch == freeze_rgb_epochs + 1:
                 optimizer = torch.optim.AdamW(
                     model.parameters(),
@@ -269,20 +289,21 @@ def main():
                     weight_decay=cfg_opt["weight_decay"],
                 )
                 remaining = (epochs - epoch + 1) * len(train_loader)
-                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(remaining, 1))
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=max(remaining, 1)
+                )
 
+        rgb_frozen = epoch <= freeze_rgb_epochs
         t0 = time.perf_counter()
         train_loss = train_one_epoch(
-            model, train_loader, optimizer, scheduler, device,
-            lambda_grad=lambda_grad,
-            grad_clip_norm=grad_clip_norm,
-            max_steps=args.max_steps,
+            model, train_loader, optimizer, scaler, scheduler, device,
+            lambda_grad=lambda_grad, grad_clip_norm=grad_clip_norm,
+            use_amp=use_amp, rgb_frozen=rgb_frozen, max_steps=args.max_steps,
         )
         val_metrics = validate(
             model, val_loader, device,
-            min_depth=min_depth,
-            max_depth=max_depth,
-            max_steps=args.max_steps,
+            min_depth=min_depth, max_depth=max_depth,
+            use_amp=use_amp, max_steps=args.max_steps,
         )
         elapsed = time.perf_counter() - t0
 
@@ -306,7 +327,6 @@ def main():
             "val_metrics": val_metrics,
         }
         torch.save(ckpt, ckpt_dir / "last.pth")
-
         if absrel < best_absrel:
             best_absrel = absrel
             torch.save(ckpt, ckpt_dir / "best.pth")

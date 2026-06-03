@@ -130,13 +130,14 @@ def run_eval_cnn(
         synchronize_if_needed(device)
         t0 = time.perf_counter()
 
-        with torch.no_grad():
+        amp_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=amp_dtype):
             pred_norm = model(rgb, bicubic_norm, conf_hi)
 
         synchronize_if_needed(device)
         runtime_s = time.perf_counter() - t0
 
-        pred_m = (pred_norm[0, 0] * DEPTH_MAX).clamp(min_depth, max_depth).cpu().numpy()
+        pred_m = (pred_norm[0, 0].float() * DEPTH_MAX).clamp(min_depth, max_depth).cpu().numpy()
         metrics = compute_metrics(pred_m, gt_np, min_depth=min_depth, max_depth=max_depth)
 
         h, w = gt_np.shape[-2:]

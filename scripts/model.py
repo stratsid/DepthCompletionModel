@@ -190,6 +190,22 @@ class RGBGuidedDepthUpsampler(nn.Module):
         nn.init.zeros_(self.head[-1].weight)
         nn.init.zeros_(self.head[-1].bias)
 
+    def _decode(
+        self,
+        rgb_feats: List[torch.Tensor],
+        bicubic_norm: torch.Tensor,
+        conf_hi: torch.Tensor,
+    ) -> torch.Tensor:
+        """Shared decoder logic. Accepts pre-computed rgb_feats for frozen-encoder path."""
+        depth_in = torch.cat([bicubic_norm, conf_hi], dim=1)
+        depth_feats = self.depth_enc(depth_in)
+        levels = self._levels
+        x = self.bot(torch.cat([depth_feats[levels], rgb_feats[levels - 1]], dim=1))
+        for i, blk in enumerate(self.up_blocks):
+            x = blk(x, rgb_feats[levels - 2 - i], depth_feats[levels - 1 - i])
+        u0 = self.up0(x, depth_feats[0])
+        return bicubic_norm + self.residual_scale * self.head(u0)
+
     def forward(
         self,
         rgb: torch.Tensor,
@@ -197,22 +213,18 @@ class RGBGuidedDepthUpsampler(nn.Module):
         conf_hi: torch.Tensor,
     ) -> torch.Tensor:
         """Returns predicted depth in *normalized* units (depth / DEPTH_MAX)."""
-        depth_in = torch.cat([bicubic_norm, conf_hi], dim=1)
-        rgb_feats = self.rgb_enc(rgb)           # [f1..f4] at strides 2,4,8,16
-        depth_feats = self.depth_enc(depth_in)  # [d0..d_levels] at strides 1,2,...,2^levels
+        return self._decode(self.rgb_enc(rgb), bicubic_norm, conf_hi)
 
-        levels = self._levels
-        b = self.bot(torch.cat([depth_feats[levels], rgb_feats[levels - 1]], dim=1))
-
-        x = b
-        for i, blk in enumerate(self.up_blocks):
-            rgb_idx = levels - 2 - i
-            d_idx = levels - 1 - i
-            x = blk(x, rgb_feats[rgb_idx], depth_feats[d_idx])
-
-        u0 = self.up0(x, depth_feats[0])
-        residual = self.head(u0)
-        return bicubic_norm + self.residual_scale * residual
+    def forward_frozen(
+        self,
+        rgb: torch.Tensor,
+        bicubic_norm: torch.Tensor,
+        conf_hi: torch.Tensor,
+    ) -> torch.Tensor:
+        """Forward pass with rgb_enc under no_grad — use when RGB encoder is frozen."""
+        with torch.no_grad():
+            rgb_feats = self.rgb_enc(rgb)
+        return self._decode(rgb_feats, bicubic_norm, conf_hi)
 
     def freeze_rgb(self):
         self.rgb_enc.freeze()

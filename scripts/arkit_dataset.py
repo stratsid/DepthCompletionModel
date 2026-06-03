@@ -378,6 +378,7 @@ def make_loaders(
         pin_memory=True,
         drop_last=True,
         persistent_workers=num_workers > 0,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_set,
@@ -386,5 +387,6 @@ def make_loaders(
         num_workers=max(1, num_workers // 2),
         pin_memory=True,
         persistent_workers=num_workers > 0,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
     return train_loader, val_loader, train_set, val_set

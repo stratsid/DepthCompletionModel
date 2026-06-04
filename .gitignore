@@ -6,3 +6,8 @@ __pycache__/
 .DS_Store
 *.pt
 *.pth
+modal_results/
+memory/
+.vscode/
+PIPELINE_STATE.md
+output_smoketest_backup.json

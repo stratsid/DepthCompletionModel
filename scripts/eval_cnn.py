@@ -18,6 +18,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -120,12 +121,19 @@ def run_eval_cnn(
     rows = []
     total_start = time.perf_counter()
 
+    conf_threshold = dataset.confidence_threshold
+
     for i, idx in enumerate(indices):
         batch = dataset[idx]
-        rgb = batch["rgb"].unsqueeze(0).to(device)
-        bicubic_norm = batch["bicubic_norm"].unsqueeze(0).to(device)
-        conf_hi = batch["conf_hi"].unsqueeze(0).to(device)
-        gt_np = batch["gt"][0].numpy()
+        rgb    = batch["rgb"].unsqueeze(0).to(device)
+        lowres = batch["lowres"].unsqueeze(0).to(device)
+        lconf  = batch["lowres_conf"].unsqueeze(0).to(device)
+        gt_np  = batch["gt"][0].numpy()
+
+        hw = rgb.shape[-2:]
+        bicubic = F.interpolate(lowres.float(), size=hw, mode="bicubic", align_corners=False).clamp(0.0, max_depth)
+        bicubic_norm = (bicubic / max_depth).clamp(0.0, 1.0)
+        conf_hi = F.interpolate((lconf >= conf_threshold).float(), size=hw, mode="bilinear", align_corners=False)
 
         synchronize_if_needed(device)
         t0 = time.perf_counter()

@@ -16,8 +16,14 @@ from pathlib import Path
 from typing import Dict, List
 
 import torch
+import torch.multiprocessing as mp
 import torch.nn as nn
+import torch.nn.functional as F
 import yaml
+
+# Use file_system sharing so DataLoader workers use /tmp (large SSD) instead of
+# /dev/shm (64 MB by default in Modal containers), preventing silent IPC deadlocks.
+mp.set_sharing_strategy("file_system")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -107,6 +113,8 @@ def train_one_epoch(
     rgb_frozen: bool = True,
     max_steps: int | None = None,
     log_every: int = 50,
+    conf_threshold: int = 2,
+    max_depth: float = 10.0,
 ) -> float:
     model.train()
     # keep frozen RGB encoder in eval mode so its BN stats don't update
@@ -115,21 +123,28 @@ def train_one_epoch(
 
     total_loss = 0.0
     n_steps = 0
+    first_loss = None
+    last_loss = None
     amp_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
     for batch_idx, batch in enumerate(loader):
         if max_steps is not None and n_steps >= max_steps:
             break
 
-        rgb        = _to_device(batch["rgb"],         device)
-        bicubic    = _to_device(batch["bicubic_norm"], device)
-        conf       = _to_device(batch["conf_hi"],      device)
-        gt         = _to_device(batch["gt"],           device)
-        valid      = _to_device(batch["valid"],        device)
+        rgb    = _to_device(batch["rgb"],        device)
+        lowres = _to_device(batch["lowres"],     device)
+        lconf  = _to_device(batch["lowres_conf"],device)
+        gt     = _to_device(batch["gt"],         device)
+        valid  = _to_device(batch["valid"],      device)
+
+        hw = rgb.shape[-2:]
+        bicubic = F.interpolate(lowres.float(), size=hw, mode="bicubic", align_corners=False).clamp(0.0, max_depth)
+        bicubic_norm = (bicubic / max_depth).clamp(0.0, 1.0)
+        conf   = F.interpolate((lconf >= conf_threshold).float(), size=hw, mode="bilinear", align_corners=False)
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             forward_fn = model.forward_frozen if rgb_frozen else model.forward
-            pred_norm = forward_fn(rgb, bicubic, conf)
+            pred_norm = forward_fn(rgb, bicubic_norm, conf)
             loss = depth_loss(pred_norm, gt, valid, lambda_grad=lambda_grad)
 
         optimizer.zero_grad(set_to_none=True)
@@ -140,13 +155,17 @@ def train_one_epoch(
         scaler.update()
         scheduler.step()
 
-        total_loss += loss.item()
+        loss_val = loss.item()
+        total_loss += loss_val
         n_steps += 1
 
-        if (batch_idx + 1) % log_every == 0:
-            print(f"  step {batch_idx + 1}: loss={loss.item():.4f}")
+        if first_loss is None:
+            first_loss = loss_val
+        last_loss = loss_val
 
-    return total_loss / max(n_steps, 1)
+    n_steps_run = max(n_steps, 1)
+    print(f"  loss: {first_loss:.4f} → {last_loss:.4f}  (avg {total_loss / n_steps_run:.4f})", flush=True)
+    return total_loss / n_steps_run
 
 
 @torch.no_grad()
@@ -158,6 +177,7 @@ def validate(
     max_depth: float,
     use_amp: bool,
     max_steps: int | None = None,
+    conf_threshold: int = 2,
 ) -> Dict[str, float]:
     model.eval()
     rows: List[dict] = []
@@ -167,13 +187,18 @@ def validate(
         if max_steps is not None and batch_idx >= max_steps:
             break
 
-        rgb     = _to_device(batch["rgb"],         device)
-        bicubic = _to_device(batch["bicubic_norm"], device)
-        conf    = _to_device(batch["conf_hi"],      device)
-        gt      = batch["gt"]  # keep on CPU for numpy metrics
+        rgb    = _to_device(batch["rgb"],         device)
+        lowres = _to_device(batch["lowres"],      device)
+        lconf  = _to_device(batch["lowres_conf"], device)
+        gt     = batch["gt"]  # keep on CPU for numpy metrics
+
+        hw = rgb.shape[-2:]
+        bicubic = F.interpolate(lowres.float(), size=hw, mode="bicubic", align_corners=False).clamp(0.0, max_depth)
+        bicubic_norm = (bicubic / max_depth).clamp(0.0, 1.0)
+        conf    = F.interpolate((lconf >= conf_threshold).float(), size=hw, mode="bilinear", align_corners=False)
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-            pred_norm = model(rgb, bicubic, conf)
+            pred_norm = model(rgb, bicubic_norm, conf)
 
         pred_m = (pred_norm.float() * DEPTH_MAX).clamp(min_depth, max_depth).cpu()
 
@@ -261,6 +286,8 @@ def main():
     grad_clip_norm   = cfg_train.get("grad_clip_norm", 1.0)
     freeze_rgb_epochs = cfg_train.get("freeze_rgb_epochs", 1)
     min_depth, max_depth = cfg_ds["min_depth"], cfg_ds["max_depth"]
+    conf_threshold   = cfg_ds.get("confidence_threshold", 2)
+    max_steps        = args.max_steps or cfg_train.get("max_steps")
 
     # ---- output dirs ----
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -298,12 +325,14 @@ def main():
         train_loss = train_one_epoch(
             model, train_loader, optimizer, scaler, scheduler, device,
             lambda_grad=lambda_grad, grad_clip_norm=grad_clip_norm,
-            use_amp=use_amp, rgb_frozen=rgb_frozen, max_steps=args.max_steps,
+            use_amp=use_amp, rgb_frozen=rgb_frozen, max_steps=max_steps,
+            conf_threshold=conf_threshold, max_depth=max_depth,
         )
         val_metrics = validate(
             model, val_loader, device,
             min_depth=min_depth, max_depth=max_depth,
-            use_amp=use_amp, max_steps=args.max_steps,
+            use_amp=use_amp, max_steps=max_steps,
+            conf_threshold=conf_threshold,
         )
         elapsed = time.perf_counter() - t0
 

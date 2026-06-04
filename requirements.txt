@@ -3,6 +3,11 @@ pandas
 pillow
 pyyaml
 matplotlib
+scipy
+opencv-python-headless
 torch
 torchvision
-git+https://github.com/prs-eth/Marigold-DC.git
+# Marigold-DC has no setup.py — installed at runtime by scripts/run_marigold_dc.py
+diffusers>=0.31.0
+transformers
+accelerate

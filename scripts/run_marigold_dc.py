@@ -17,8 +17,13 @@ MARIGOLD_REPO_DIR = Path(__file__).resolve().parents[1] / "third_party" / "Marig
 
 
 def ensure_marigold_installed():
+    """Clone Marigold-DC and install its requirements, then return the module.
+
+    Marigold-DC is a single-file repo with no setup.py — we clone it, install
+    its pip requirements, add it to sys.path, and import marigold_dc directly.
+    """
     try:
-        return importlib.import_module("marigold")
+        return importlib.import_module("marigold_dc")
     except ImportError:
         MARIGOLD_REPO_DIR.parent.mkdir(parents=True, exist_ok=True)
 
@@ -28,11 +33,17 @@ def ensure_marigold_installed():
                 check=True,
             )
 
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-e", str(MARIGOLD_REPO_DIR)],
-            check=True,
-        )
-        return importlib.import_module("marigold")
+        req_file = MARIGOLD_REPO_DIR / "requirements.txt"
+        if req_file.exists():
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-r", str(req_file)],
+                check=True,
+            )
+
+        if str(MARIGOLD_REPO_DIR) not in sys.path:
+            sys.path.insert(0, str(MARIGOLD_REPO_DIR))
+
+        return importlib.import_module("marigold_dc")
 
 
 MarigoldDepthCompletionPipeline = ensure_marigold_installed().MarigoldDepthCompletionPipeline
@@ -96,7 +107,7 @@ def run_marigold_dc(
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
     pipe = MarigoldDepthCompletionPipeline.from_pretrained(
-        "prs-eth/marigold-depth-completion-v1-0"
+        "prs-eth/marigold-depth-v1-0"
     ).to(device)
 
     dataset = ARKitUpsampleDataset(
@@ -112,9 +123,13 @@ def run_marigold_dc(
 
     sample_indices = list(range(len(dataset)))
     if max_samples is not None:
-        sample_indices = sample_indices[:max_samples]
+        # Uniform stride across the full split so all scenes are represented.
+        # e.g. 11739 samples / 500 target = stride 23 → ~510 samples across all 44 scenes
+        stride = max(1, len(sample_indices) // max_samples)
+        sample_indices = sample_indices[::stride]
 
-    print(f"Evaluating {len(sample_indices)} samples from {split_path}")
+    print(f"Evaluating {len(sample_indices)} samples from {split_path} "
+          f"({'all' if max_samples is None else f'stride-{stride}, ~{len(sample_indices)}'})")
 
     output_csv_path.parent.mkdir(parents=True, exist_ok=True)
     if summary_json_path is None:
@@ -130,17 +145,18 @@ def run_marigold_dc(
         synchronize_if_needed(device)
         start = time.perf_counter()
 
-        # Marigold-DC takes RGB + sparse depth and returns dense predicted depth.
-        with torch.no_grad():
-            output = pipe(
-                image=rgb,
-                sparse_depth=sparse_depth,
-            )
+        # Marigold-DC uses gradient-based optimization internally to align the
+        # diffusion output with sparse depth hints — must NOT be wrapped in no_grad.
+        output = pipe(
+            image=rgb,
+            sparse_depth=sparse_depth,
+        )
 
         synchronize_if_needed(device)
         runtime_s = time.perf_counter() - start
 
-        pred = output.depth_np  # expected shape: (H, W), in meters
+        # Pipeline returns raw ndarray in some versions, wrapped object in others
+        pred = output if isinstance(output, np.ndarray) else output.depth_np
         metrics = compute_metrics(pred, gt_depth, min_depth=min_depth, max_depth=max_depth)
 
         height, width = gt_depth.shape[-2:]

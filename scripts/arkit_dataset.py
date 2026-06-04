@@ -72,7 +72,13 @@ def _resize_image(arr: np.ndarray, size: Tuple[int, int], mode: str) -> np.ndarr
 
 
 def _load_png(path: Path) -> np.ndarray:
-    return np.array(Image.open(path))
+    import cv2
+    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise FileNotFoundError(f"cv2 could not read {path}")
+    if img.ndim == 3 and img.shape[2] >= 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return img
 
 
 def _load_metadata(data_root: Path) -> tuple[dict[str, str], dict[str, str]]:
@@ -270,31 +276,12 @@ class ARKitUpsampleDataset(Dataset):
                 valid = valid[:, high_y:high_y + crop_h, high_x:high_x + crop_w]
                 height, width = crop_h, crop_w
 
-        bicubic = F.interpolate(
-            lo_t.unsqueeze(0).float(),
-            size=(height, width),
-            mode="bicubic",
-            align_corners=False,
-        ).squeeze(0)
-        bicubic = bicubic.clamp(min=0.0, max=self.max_depth)
-
-        conf_hi = F.interpolate(
-            (conf_t >= self.confidence_threshold).float().unsqueeze(0),
-            size=(height, width),
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(0)
-
-        bicubic_norm = (bicubic / self.max_depth).clamp(0.0, 1.0)
         rgb_norm = self._rgb_norm(rgb_t)
 
         sample = {
             "rgb": rgb_norm,
             "lowres": lo_t,
             "lowres_conf": conf_t,
-            "bicubic": bicubic,
-            "bicubic_norm": bicubic_norm,
-            "conf_hi": conf_hi,
             "gt": gt_t,
             "valid": valid,
             "identifier": record.identifier,
@@ -378,15 +365,15 @@ def make_loaders(
         pin_memory=True,
         drop_last=True,
         persistent_workers=num_workers > 0,
-        prefetch_factor=4 if num_workers > 0 else None,
+        prefetch_factor=1 if num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_set,
-        batch_size=1,
+        batch_size=16,
         shuffle=False,
         num_workers=max(1, num_workers // 2),
         pin_memory=True,
         persistent_workers=num_workers > 0,
-        prefetch_factor=4 if num_workers > 0 else None,
+        prefetch_factor=1 if num_workers > 0 else None,
     )
     return train_loader, val_loader, train_set, val_set

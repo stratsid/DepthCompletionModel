@@ -74,6 +74,14 @@ def load_marigold_summary(eval_dir: Path = Path("eval")) -> Optional[dict]:
         return json.load(f)
 
 
+def load_bicubic_summary(eval_dir: Path = Path("eval")) -> Optional[dict]:
+    path = eval_dir / "bicubic_results.summary.json"
+    if not path.exists():
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
 # ---------------------------------------------------------------------------
 # Per-run training curves
 # ---------------------------------------------------------------------------
@@ -100,7 +108,7 @@ def plot_training_curves(run_name: str, df: pd.DataFrame, out_dir: Path):
     ]
     for col, ax, title, color in metric_axes:
         if col in df.columns:
-            ax.plot(df["epoch"], df[col], f"{color}-o", markersize=3)
+            ax.plot(df["epoch"], df[col], "-o", color=color, markersize=3)
         ax.set_xlabel("Epoch")
         ax.set_title(title)
         ax.grid(True, alpha=0.3)
@@ -188,6 +196,127 @@ def plot_val_curves_comparison(
 
 
 # ---------------------------------------------------------------------------
+# Per-category ablation grouped bar charts
+# ---------------------------------------------------------------------------
+
+ABLATION_GROUPS = [
+    {
+        "title": "Filter Size Ablation",
+        "filename": "ablation_filter_size.png",
+        "runs": ["ablation_filter_1x1", "baseline", "ablation_filter_5x5"],
+        "labels": ["1×1", "3×3 (baseline)", "5×5"],
+    },
+    {
+        "title": "Encoder Levels Ablation",
+        "filename": "ablation_encoder_levels.png",
+        "runs": ["ablation_levels_2", "ablation_levels_3", "baseline"],
+        "labels": ["2 levels", "3 levels", "4 levels (baseline)"],
+    },
+    {
+        "title": "Channel Width Ablation",
+        "filename": "ablation_channel_width.png",
+        "runs": ["ablation_channels_narrow", "baseline", "ablation_channels_wide"],
+        "labels": ["Narrow\n(16,32,64,128)", "Default\n(32,64,128,256)", "Wide\n(64,128,256,512)"],
+    },
+]
+
+HIGHLIGHT_METRICS = ["absrel", "rmse", "d1"]
+
+
+def plot_ablation_group(
+    group: dict,
+    run_summaries: Dict[str, dict],
+    out_dir: Path,
+):
+    runs = group["runs"]
+    labels = group["labels"]
+    available = [(r, l) for r, l in zip(runs, labels) if r in run_summaries]
+    if len(available) < 2:
+        print(f"  Skipping {group['title']}: fewer than 2 configs available.")
+        return
+
+    avail_runs, avail_labels = zip(*available)
+    fig, axes = plt.subplots(1, len(HIGHLIGHT_METRICS), figsize=(4 * len(HIGHLIGHT_METRICS), 4))
+    fig.suptitle(group["title"], fontsize=13, fontweight="bold")
+
+    x = np.arange(len(avail_runs))
+    colors = ["#4C9BE8" if "baseline" in r else "#E8A74C" for r in avail_runs]
+
+    for ax, metric in zip(axes, HIGHLIGHT_METRICS):
+        values = [run_summaries[r].get(metric, float("nan")) for r in avail_runs]
+        bars = ax.bar(x, values, color=colors, edgecolor="white", linewidth=0.8, width=0.5)
+        ax.set_xticks(x)
+        ax.set_xticklabels(avail_labels, fontsize=8)
+        ax.set_title(METRIC_LABELS.get(metric, metric), fontsize=10)
+        ax.grid(True, axis="y", alpha=0.3)
+        for bar, val in zip(bars, values):
+            if not np.isnan(val):
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() * 1.01,
+                        f"{val:.3f}", ha="center", va="bottom", fontsize=8)
+
+    plt.tight_layout()
+    out_path = out_dir / group["filename"]
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {out_path}")
+
+
+def plot_full_comparison(
+    run_summaries: Dict[str, dict],
+    marigold_summary: Optional[dict],
+    bicubic_summary: Optional[dict],
+    out_dir: Path,
+):
+    """Extended comparison chart including bicubic and Marigold baselines."""
+    named = {}
+    if bicubic_summary:
+        named["Bicubic"] = bicubic_summary
+    if marigold_summary:
+        named["Marigold-DC"] = marigold_summary
+    named.update(run_summaries)
+
+    if len(named) < 2:
+        return
+
+    display = list(named.keys())
+    colors = []
+    for n in display:
+        if n == "Marigold-DC":
+            colors.append("steelblue")
+        elif n == "Bicubic":
+            colors.append("gray")
+        else:
+            colors.append("salmon")
+
+    metrics = ["absrel", "rmse", "d1"]
+    fig, axes = plt.subplots(1, 3, figsize=(14, 5))
+    fig.suptitle("Full Model Comparison — Test Set (AbsRel/RMSE: lower is better, δ₁: higher is better)", fontsize=11)
+
+    for ax, metric in zip(axes, metrics):
+        values = [named[n].get(metric, float("nan")) for n in display]
+        x = np.arange(len(display))
+        bars = ax.bar(x, values, color=colors, edgecolor="white", linewidth=0.5)
+        ax.set_xticks(x)
+        ax.set_xticklabels(display, rotation=35, ha="right", fontsize=7)
+        ax.set_title(METRIC_LABELS.get(metric, metric), fontsize=10)
+        ax.grid(True, axis="y", alpha=0.3)
+        for bar, val in zip(bars, values):
+            if not np.isnan(val):
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() * 1.01,
+                        f"{val:.3f}", ha="center", va="bottom", fontsize=6.5)
+
+    # Legend
+    from matplotlib.patches import Patch
+    handles = [Patch(color="gray", label="Bicubic"), Patch(color="steelblue", label="Marigold-DC"), Patch(color="salmon", label="CNN models")]
+    fig.legend(handles=handles, loc="lower center", ncol=3, fontsize=8, bbox_to_anchor=(0.5, -0.02))
+    plt.tight_layout()
+    out_path = out_dir / "full_comparison.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {out_path}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -221,8 +350,19 @@ def generate_all_plots(
     if marigold_summary is None:
         print("  No Marigold-DC summary found.")
 
+    bicubic_summary = load_bicubic_summary(eval_dir)
+    if bicubic_summary is None:
+        print("  No bicubic summary found.")
+
     if run_summaries or marigold_summary:
         plot_comparison(run_summaries, marigold_summary, out_dir)
+
+    # Extended comparison (bicubic + Marigold + all CNNs)
+    plot_full_comparison(run_summaries, marigold_summary, bicubic_summary, out_dir)
+
+    # Per-category ablation grouped bar charts
+    for group in ABLATION_GROUPS:
+        plot_ablation_group(group, run_summaries, out_dir)
 
     for metric in ["val_absrel", "val_rmse", "val_d1"]:
         if run_logs:

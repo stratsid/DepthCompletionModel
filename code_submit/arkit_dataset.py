@@ -9,9 +9,11 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+import cv2
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms as T
+
 
 NATIVE_LOW = (192, 256)
 MM_TO_M = 1000.0
@@ -19,6 +21,7 @@ MM_TO_M = 1000.0
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
+#depth min and max in meters
 DEPTH_MIN = 0.1
 DEPTH_MAX = 10.0
 
@@ -38,14 +41,14 @@ class SampleRecord:
     frame_name: str
     sky_direction: str
 
-
+#normalize names of data folds
 def _normalize_fold_name(value: str) -> str:
     key = str(value).strip().lower()
     if key not in FOLD_MAP:
         raise ValueError(f"unknown fold name {value!r}")
     return FOLD_MAP[key]
 
-
+#rotate images so they are rightside up
 def _rotate_np(img: np.ndarray, direction: str) -> np.ndarray:
     if direction == "Up":
         return img
@@ -55,24 +58,24 @@ def _rotate_np(img: np.ndarray, direction: str) -> np.ndarray:
         return np.rot90(img, k=1).copy()
     if direction == "Down":
         return np.rot90(img, k=2).copy()
+
     raise ValueError(f"unknown sky_direction {direction!r}")
 
-
+#resize image
 def _resize_image(arr: np.ndarray, size: Tuple[int, int], mode: str) -> np.ndarray:
     height, width = size
-    if arr.shape[:2] == (height, width):
+    if arr.shape[:2] == (height, width): #if already correct size, do nothing
         return arr
 
-    pil = Image.fromarray(arr)
-    if arr.ndim == 2:
+    pil = Image.fromarray(arr) #use pillow library to resize if incorrect size
+    if (arr.ndim == 2):
         resample = Image.BILINEAR if mode == "bilinear" else Image.NEAREST
     else:
         resample = Image.BILINEAR
     return np.array(pil.resize((width, height), resample=resample))
 
-
+#load png image from disk
 def _load_png(path: Path) -> np.ndarray:
-    import cv2
     img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
     if img is None:
         raise FileNotFoundError(f"cv2 could not read {path}")
@@ -80,27 +83,28 @@ def _load_png(path: Path) -> np.ndarray:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     return img
 
-
+#read data from metadata.csv files
 def _load_metadata(data_root: Path) -> tuple[dict[str, str], dict[str, str]]:
     metadata_path = data_root / "metadata.csv"
     if not metadata_path.exists():
         raise FileNotFoundError(f"missing ARKitScenes metadata file: {metadata_path}")
 
     meta = pd.read_csv(metadata_path)
-    required = {"video_id", "fold", "sky_direction"}
+    required = {"video_id", "fold", "sky_direction"} #necessary metadata columns
     missing = required.difference(meta.columns)
     if missing:
-        raise ValueError(f"metadata.csv is missing required columns: {sorted(missing)}")
+        raise ValueError(f"metadata.csv is missing required columns: {missing}")
 
     video_to_fold = {}
     video_to_sky = {}
-    for row in meta.itertuples(index=False):
+    for row in meta.itertuples(index=False): #map each video id to its fold and sky direction
         video_id = str(row.video_id)
         video_to_fold[video_id] = _normalize_fold_name(row.fold)
         video_to_sky[video_id] = str(row.sky_direction)
+    
     return video_to_fold, video_to_sky
 
-
+#strip sampleids of whitespace, blank lines, and comments
 def parse_sample_ids(lines: Iterable[str]) -> list[str]:
     sample_ids = []
     for line in lines:
@@ -108,13 +112,14 @@ def parse_sample_ids(lines: Iterable[str]) -> list[str]:
         if not line or line.startswith("#"):
             continue
         sample_ids.append(line)
+    
     return sample_ids
 
 
 def load_sample_ids(split_path: Path) -> list[str]:
     return parse_sample_ids(split_path.read_text().splitlines())
 
-
+#pytorch dataset class for ARKitScenes
 class ARKitUpsampleDataset(Dataset):
     def __init__(
         self,
@@ -138,22 +143,31 @@ class ARKitUpsampleDataset(Dataset):
         self.max_depth = max_depth
 
         height, width = target_hw
+        #ensure dimensions are compatible with our model's downsampling
         if height % 4 != 0 or width % 4 != 0:
             raise ValueError("target resolution must be divisible by 4")
 
+        #upsampled resolution = target // sparse lidar depth dim
         self.upsample_factor = width // NATIVE_LOW[1]
+        #enforce aspect ratio
         if height // NATIVE_LOW[0] != self.upsample_factor:
             raise ValueError("target resolution must preserve the native 4:3 low-res aspect ratio")
         self.lowres_hw = (height // self.upsample_factor, width // self.upsample_factor)
 
+        
         video_to_fold, video_to_sky = _load_metadata(self.root)
+
+        #SampleRecords for this split
         self.records = self._build_records(
             sample_ids=load_sample_ids(self.split_path),
             video_to_fold=video_to_fold,
             video_to_sky=video_to_sky,
         )
 
+        #apply imagenet normalization to RGB images
         self._rgb_norm = T.Normalize(IMAGENET_MEAN, IMAGENET_STD)
+        #data augmentation
+        #randomly adjust brightness, contrast, saturation, and hue
         self._color_jitter = (
             T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05)
             if augment
@@ -168,12 +182,15 @@ class ARKitUpsampleDataset(Dataset):
     ) -> list[SampleRecord]:
         records = []
         for sample_id in sample_ids:
+            #expect paths like "video_id/frame.png"
             parts = Path(sample_id).parts
             if len(parts) != 2:
                 raise ValueError(f"sample ID must be 'video_id/frame.png', got {sample_id!r}")
+            
             video_id, frame_name = parts
             if video_id not in video_to_fold:
                 raise KeyError(f"video ID {video_id!r} missing from metadata.csv")
+
             record = SampleRecord(
                 identifier=sample_id,
                 split_folder=video_to_fold[video_id],
@@ -181,10 +198,13 @@ class ARKitUpsampleDataset(Dataset):
                 frame_name=frame_name,
                 sky_direction=video_to_sky[video_id],
             )
+            #ensure image/depth files exist on disk
             self._assert_modalities_exist(record)
             records.append(record)
+
         return records
 
+    #ensures the 4 required files for a given frame are present
     def _assert_modalities_exist(self, record: SampleRecord) -> None:
         base = self.root / record.split_folder / record.video_id
         required = (
@@ -193,13 +213,16 @@ class ARKitUpsampleDataset(Dataset):
             base / "lowres_depth" / record.frame_name,
             base / "confidence" / record.frame_name,
         )
+
         missing = [str(path) for path in required if not path.is_file()]
         if missing:
             raise FileNotFoundError(f"missing ARKitScenes modalities for {record.identifier}: {missing}")
 
+    #total # of frames in this dataset
     def __len__(self) -> int:
         return len(self.records)
 
+    #load raw pngs from disk w correct orientation
     def _load_one(self, record: SampleRecord) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         base = self.root / record.split_folder / record.video_id
         rgb = _load_png(base / "wide" / record.frame_name)
@@ -224,31 +247,41 @@ class ARKitUpsampleDataset(Dataset):
         height, width = self.target_hw
         low_h, low_w = self.lowres_hw
 
+        #resize images
         rgb = _resize_image(rgb, (height, width), mode="bilinear")
         gt_mm = _resize_image(gt_mm, (height, width), mode="nearest")
         if lo_mm.shape != (low_h, low_w):
             lo_mm = _resize_image(lo_mm, (low_h, low_w), mode="nearest")
             conf = _resize_image(conf, (low_h, low_w), mode="nearest")
 
+        #unit conversion
         gt = gt_mm.astype(np.float32) / MM_TO_M
         lo = lo_mm.astype(np.float32) / MM_TO_M
+
+        #zero sparse depth pixels where confidence is below threshold
         lo_filtered = np.where(conf >= self.confidence_threshold, lo, 0.0).astype(np.float32)
 
+        #convert RGB for pytorch
         rgb_t = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
+
+        #add channel dim to 2d depth arrays
         gt_t = torch.from_numpy(gt).unsqueeze(0)
         lo_t = torch.from_numpy(lo_filtered).unsqueeze(0)
         conf_t = torch.from_numpy(conf.astype(np.uint8)).unsqueeze(0)
 
+        #binary mask of ground truth pixels
         valid = (
             (gt_t > self.min_depth)
             & (gt_t < self.max_depth)
             & torch.isfinite(gt_t)
         )
-
+        
+        #data augmentation
         if apply_augmentation:
             if self._color_jitter is not None:
                 rgb_t = self._color_jitter(rgb_t)
 
+            #randomly flip horizontally
             if random.random() < 0.5:
                 rgb_t = torch.flip(rgb_t, dims=[2])
                 gt_t = torch.flip(gt_t, dims=[2])
@@ -256,19 +289,29 @@ class ARKitUpsampleDataset(Dataset):
                 lo_t = torch.flip(lo_t, dims=[2])
                 conf_t = torch.flip(conf_t, dims=[2])
 
+            #randomly crop
             if self.crop_hw is not None:
                 crop_h, crop_w = self.crop_hw
+
+                #crop size for lowres
                 low_crop_h = crop_h // self.upsample_factor
                 low_crop_w = crop_w // self.upsample_factor
+
                 if crop_h % self.upsample_factor != 0 or crop_w % self.upsample_factor != 0:
                     raise ValueError("crop size must be divisible by the upsample factor")
+
                 if low_crop_h > low_h or low_crop_w > low_w:
                     raise ValueError("crop size exceeds low-res input size")
+                
+                #pick random starting pos for crop
                 low_y = random.randint(0, low_h - low_crop_h)
                 low_x = random.randint(0, low_w - low_crop_w)
+
+                #find equivalent crop for highres
                 high_y = low_y * self.upsample_factor
                 high_x = low_x * self.upsample_factor
 
+                #apply crop
                 lo_t = lo_t[:, low_y:low_y + low_crop_h, low_x:low_x + low_crop_w]
                 conf_t = conf_t[:, low_y:low_y + low_crop_h, low_x:low_x + low_crop_w]
                 rgb_t = rgb_t[:, high_y:high_y + crop_h, high_x:high_x + crop_w]
@@ -276,8 +319,10 @@ class ARKitUpsampleDataset(Dataset):
                 valid = valid[:, high_y:high_y + crop_h, high_x:high_x + crop_w]
                 height, width = crop_h, crop_w
 
+        #imagenet norm to RGB tensors
         rgb_norm = self._rgb_norm(rgb_t)
 
+        #final batch
         sample = {
             "rgb": rgb_norm,
             "lowres": lo_t,
@@ -292,13 +337,16 @@ class ARKitUpsampleDataset(Dataset):
             sample["lowres_np"] = lo_filtered
         return sample
 
+    #get preprocessed sample by index
     def __getitem__(self, idx: int):
         return self._prepare_modalities(
             self.records[idx],
             apply_augmentation=self.augment,
             include_raw_arrays=False,
         )
-
+    
+    #retrieve data formatted for marigold
+    #projects valid pixels from lowres sensor data onto highres grid
     def get_marigold_sample(self, idx: int) -> tuple[str, np.ndarray, np.ndarray, np.ndarray]:
         sample = self._prepare_modalities(
             self.records[idx],
@@ -309,6 +357,7 @@ class ARKitUpsampleDataset(Dataset):
         gt = np.asarray(sample["gt_np"], dtype=np.float32)
         lowres = np.asarray(sample["lowres_np"], dtype=np.float32)
 
+        #get coordinates on highres grid for each pixel on lowres grid 
         height, width = gt.shape
         low_h, low_w = lowres.shape
         ys = np.arange(low_h) * self.upsample_factor + self.upsample_factor // 2
@@ -317,12 +366,13 @@ class ARKitUpsampleDataset(Dataset):
         xs = np.clip(xs, 0, width - 1)
         grid_y, grid_x = np.meshgrid(ys, xs, indexing="ij")
 
+        #start with blank highres array, populate it where lowres depth map has nonzero data
         sparse = np.zeros((height, width), dtype=np.float32)
         valid = np.isfinite(lowres) & (lowres > 0)
         sparse[grid_y[valid], grid_x[valid]] = lowres[valid]
         return str(sample["identifier"]), rgb, sparse, gt
 
-
+#prepare everything for training
 def make_loaders(
     root: str | Path,
     target_hw: Tuple[int, int],

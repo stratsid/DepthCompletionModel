@@ -3,14 +3,18 @@ import numpy as np
 
 METRIC_KEYS = ["rmse", "mae", "absrel", "d1", "d2", "d3"]
 
-
+#compute depth eval metrics for pred/ground truth pair, returns a dictionary
 def compute_metrics(pred, gt, min_depth=0.1, max_depth=10.0, eps=1e-6):
+    #force type float32 for consistency in calculations
     pred = np.asarray(pred, dtype=np.float32)
     gt = np.asarray(gt, dtype=np.float32)
 
+    #ensure prediction and ground truth dimensions match
     if pred.shape != gt.shape:
         raise ValueError(f"pred and gt must have the same shape, got {pred.shape} and {gt.shape}")
 
+    #binary mask of valid pixels
+    #gt within sensor bounds and pred/gt have finite values
     mask = (
         (gt > min_depth)
         & (gt < max_depth)
@@ -18,6 +22,7 @@ def compute_metrics(pred, gt, min_depth=0.1, max_depth=10.0, eps=1e-6):
         & np.isfinite(pred)
     )
 
+    #count num of valid pixels, return NaNs if zero
     valid_pixels = int(mask.sum())
     if valid_pixels == 0:
         return {
@@ -30,12 +35,15 @@ def compute_metrics(pred, gt, min_depth=0.1, max_depth=10.0, eps=1e-6):
             "valid_pixels": 0,
         }
 
+    #extract valid pixels, ensure no 0s can ruin division
     pred_valid = np.maximum(pred[mask], eps)
     gt_valid = np.maximum(gt[mask], eps)
 
+    #pixelwise errors
     error = pred_valid - gt_valid
     abs_error = np.abs(error)
 
+    #calculate error metrics
     rmse = np.sqrt(np.mean(error ** 2))
     mae = np.mean(abs_error)
     absrel = np.mean(abs_error / gt_valid)
@@ -55,7 +63,7 @@ def compute_metrics(pred, gt, min_depth=0.1, max_depth=10.0, eps=1e-6):
         "valid_pixels": valid_pixels,
     }
 
-
+#aggregate persample metrics into dataset avg, returns a dictionary
 def summarize_metric_rows(rows, metric_keys=METRIC_KEYS):
     if len(rows) == 0:
         return {key: np.nan for key in metric_keys} | {"valid_pixels": 0}

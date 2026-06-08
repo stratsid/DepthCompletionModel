@@ -16,8 +16,10 @@ from eval.metrics import METRIC_KEYS, compute_metrics, summarize_metric_rows
 from scripts.arkit_dataset import ARKitUpsampleDataset
 from scripts.model import RGBGuidedDepthUpsampler, count_parameters
 
+#max valid depth in meters
 DEPTH_MAX = 10.0
 
+#output csv columns
 CSV_FIELDNAMES = [
     "sample_id",
     "rmse",
@@ -33,12 +35,12 @@ CSV_FIELDNAMES = [
     "width",
 ]
 
-
+#force cpu to wait for gpu to finish all pending tasks
 def synchronize_if_needed(device: torch.device):
     if device.type == "cuda":
         torch.cuda.synchronize()
 
-
+#reconstruct model from saved config and load weights
 def load_model_from_checkpoint(
     checkpoint_path: Path,
     device: torch.device,
@@ -54,13 +56,14 @@ def load_model_from_checkpoint(
         depth_channels=tuple(cfg_model.get("depth_channels", [32, 64, 128, 256])),
         fusion_decoder_channels=tuple(cfg_model.get("fusion_decoder_channels", [256, 128, 64, 32])),
     )
+    #load weights, set to eval mode, freeze RGB backbone
     model.load_state_dict(ckpt["model_state"])
     model.eval()
     model.freeze_rgb()
     model.to(device)
     return model, ckpt["config"]
 
-
+#eval loop: process data one sample at a time, run inference, compute metrics, aggregate final stats
 def run_eval_cnn(
     checkpoint_path: Path,
     split_path: Path,
@@ -75,6 +78,7 @@ def run_eval_cnn(
     confidence_threshold: int = 2,
     device: Optional[torch.device] = None,
 ):
+    #init/setup
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Running CNN eval on {device}")
@@ -112,21 +116,26 @@ def run_eval_cnn(
 
     conf_threshold = dataset.confidence_threshold
 
+    #main eval loop
     for i, idx in enumerate(indices):
+        #add batch dim and move tensors to device
         batch = dataset[idx]
         rgb    = batch["rgb"].unsqueeze(0).to(device)
         lowres = batch["lowres"].unsqueeze(0).to(device)
         lconf  = batch["lowres_conf"].unsqueeze(0).to(device)
-        gt_np  = batch["gt"][0].numpy()
+        gt_np  = batch["gt"][0].numpy() #gt kept as numpy array for metric calculation
 
         hw = rgb.shape[-2:]
+        #preprocess lowres depth input, interpolate lowres depth up to highres w bicubic smoothing 
         bicubic = F.interpolate(lowres.float(), size=hw, mode="bicubic", align_corners=False).clamp(0.0, max_depth)
-        bicubic_norm = (bicubic / max_depth).clamp(0.0, 1.0)
-        conf_hi = F.interpolate((lconf >= conf_threshold).float(), size=hw, mode="bilinear", align_corners=False)
+        bicubic_norm = (bicubic / max_depth).clamp(0.0, 1.0) #normalize depth to [0,1]
+        conf_hi = F.interpolate((lconf >= conf_threshold).float(), size=hw, mode="bilinear", align_corners=False) #binary mask of confident pixels
 
+        #inference and timimg
         synchronize_if_needed(device)
         t0 = time.perf_counter()
 
+        #AMP to speed up inference and save memory
         amp_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=amp_dtype):
             pred_norm = model(rgb, bicubic_norm, conf_hi)
@@ -134,8 +143,10 @@ def run_eval_cnn(
         synchronize_if_needed(device)
         runtime_s = time.perf_counter() - t0
 
+        #postprocess and metrics calculation
+        #revert from [0,1] to meters
         pred_m = (pred_norm[0, 0].float() * DEPTH_MAX).clamp(min_depth, max_depth).cpu().numpy()
-        metrics = compute_metrics(pred_m, gt_np, min_depth=min_depth, max_depth=max_depth)
+        metrics = compute_metrics(pred_m, gt_np, min_depth=min_depth, max_depth=max_depth) #calculate depth metrics
 
         h, w = gt_np.shape[-2:]
         row = {
@@ -156,13 +167,16 @@ def run_eval_cnn(
 
     total_runtime_s = time.perf_counter() - total_start
 
+    #export data to csv
     with open(output_csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
         writer.writeheader()
         writer.writerows(rows)
 
+    #aggregate data in json
     metric_summary = summarize_metric_rows(rows, metric_keys=METRIC_KEYS)
-
+    
+    #exclude warmup samples from runtime stats
     timed_rows = rows[warmup_samples:] if len(rows) > warmup_samples else rows
     runtime_values = np.array([r["runtime_s"] for r in timed_rows], dtype=np.float64)
 
@@ -228,7 +242,7 @@ def run_eval_cnn(
 
     return rows, summary
 
-
+#define and parse command line args
 def parse_args():
     p = argparse.ArgumentParser(description="Evaluate CNN depth completion checkpoint.")
     p.add_argument("--checkpoint", type=Path, required=True)
